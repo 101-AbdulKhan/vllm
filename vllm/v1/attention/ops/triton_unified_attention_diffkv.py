@@ -28,6 +28,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
@@ -452,6 +453,26 @@ def unified_attention_diffkv(
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     launch_kw: dict[str, int] = {}
+    # With 16 query heads per KV head a 16-row block covers one query position,
+    # so every position re-reads its KV prefix. Long prefills share those loads
+    # between 8 positions; tuned on GA100 with a bf16 KV cache (#61095). Exact
+    # sm_80 only: sm_86/89 lack the shared memory. Batch invariance forbids a
+    # tile shape that depends on the batch's longest query.
+    tuned_sm80_prefill = (
+        max_seqlen_q >= 64
+        and num_queries_per_kv == 16
+        and head_size_qk == 192
+        and head_size_v == 128
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and not is_batch_invariant
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(80)
+    )
+    if tuned_sm80_prefill:
+        BLOCK_M = 128
+        launch_kw["num_warps"] = 8
+        launch_kw["num_stages"] = 2
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
@@ -498,6 +519,8 @@ def unified_attention_diffkv(
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
     if spec_tile is not None:
         tile_size = spec_tile
+    elif tuned_sm80_prefill:
+        tile_size = 64
 
     grid: tuple[Any, ...]
     if use_3d:

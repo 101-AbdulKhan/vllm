@@ -28,8 +28,9 @@ pytestmark = pytest.mark.skip_global_cleanup
 DEVICE_TYPE = current_platform.device_type
 
 # (num_query_heads, num_kv_heads): MHA, GQA, and the num_kv_heads==1
-# (degenerate-stride) case.
-NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
+# (degenerate-stride) case. (32, 2) is MiMo-V2's GQA 16: with (192, 128)
+# and a prefill of 64+ tokens it takes the tuned sm_80 launch.
+NUM_HEADS = [(4, 4), (8, 2), (5, 1), (32, 2)]
 # (head_size_qk, head_size_v).  (192, 128) is the canonical asymmetric
 # DiffKV shape; FA4 on Blackwell only supports head_size>128 when it is
 # 192, and FA3 on Hopper supports it too -- so this pair is runnable on
@@ -102,15 +103,16 @@ def test_triton_unified_attn_diffkv_vs_reference(
 ) -> None:
     head_size_qk, head_size_v = head_sizes
 
-    # FA3/FA4 is the reference on NVIDIA; ROCm and the FP8 KV cache (FA would
-    # also quantize Q) use the PyTorch oracle.
+    # FA3/FA4 is the reference on NVIDIA; ROCm, the FP8 KV cache (FA would
+    # also quantize Q) and GPUs without FA3/FA4, such as A100, use the
+    # PyTorch oracle.
     use_torch_ref = current_platform.is_rocm() or kv_cache_dtype is not None
     if not use_torch_ref:
         fa_version = get_flash_attn_version(
             head_size=head_size_qk, head_size_v=head_size_v
         )
         if not is_flash_attn_varlen_func_available() or fa_version not in (3, 4):
-            pytest.skip(f"FA DiffKV needs FA3/FA4 (got version {fa_version}).")
+            use_torch_ref = True
 
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(0)
